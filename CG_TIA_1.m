@@ -33,24 +33,20 @@ L2         = 0.6e-6;  % Slightly longer channel to boost ro2 (decrease gds2)
 gm1 = 1 / Rin_target; % Target transconductance for M1 (~10 mS)
 id  = gm1 / gm_id1;   % Required drain bias current for both M1 and M2 (~666.7 uA)
 
-% Actual bias voltages from Cadence operating point
-%VDS_op1   = 1.8-(id*rd);  % VDS for M1 (V)
-%VSB_op1   = 0.067;  % VSB for M1 (V) -> This forms the drain voltage for M2!
-%VDS_op2   = 0.067;  % VDS for M2 = Node X DC voltage (1.073 V)
-%VSB_op2   = 0;      % M2 Source is tied to Ground (0 V)
+% Actual bias voltages dynamically calculated
+VSB_op1 = 0.2; % Target DC voltage at input node (Source M1 / Drain M2)
+VDS_op1 = VDD - (id * rd) - VSB_op1; % Dynamic VDS for M1
+VDS_op2 = VSB_op1;                   % VDS for M2 is the input node voltage
 
 % --- Sizing M1 ---
-VGS1 = look_upVGS(nch, 'GM_ID', gm_id1, 'VDS', 0.93, 'VSB', 0.2, 'L', L1);
-VG1 = VGS1 + 0.2;
+VGS1 = look_upVGS(nch, 'GM_ID', gm_id1, 'VDS', VDS_op1, 'VSB', VSB_op1, 'L', L1);
+VG1  = VGS1 + VSB_op1;
 jd1  = look_up(nch, 'ID_W',  'GM_ID', gm_id1, 'L', L1);
 w1   = id / jd1;
 
 % --- Sizing M2 ---
-%VGS_ref = look_upVGS(nch, 'GM_ID', gm_id2, 'VGS', 'L', L2);
-VGS2 = look_upVGS(nch, 'GM_ID', gm_id2, 'VDS', 0.2, 'L', L2);
-jd_ref = look_up(nch, 'ID_W',  'GM_ID', gm_id2, 'VDS', VGS2, 'L', L2);
-w2_ref = id / jd_ref;
-jd2  = look_up(nch, 'ID_W',  'GM_ID', gm_id2, 'VDS', 0.2, 'L', L2);
+VGS2 = look_upVGS(nch, 'GM_ID', gm_id2, 'VDS', VDS_op2, 'L', L2);
+jd2  = look_up(nch, 'ID_W',  'GM_ID', gm_id2, 'VDS', VDS_op2, 'L', L2);
 w2   = id / jd2;
 
 % =========================================================================
@@ -65,7 +61,6 @@ gm_cdd1 = look_up(nch, 'GM_CDD', 'GM_ID', gm_id1, 'L', L1);
 gds1 = gds_gm1 * gm1;
 
 % --- M2 Parameters ---
-% Extract M2 ratios using M2 target gm/ID, L2, and its distinct bias conditions
 gds_gm2 = look_up(nch, 'GDS_GM', 'GM_ID', gm_id2, 'L', L2);
 gm_cdd2 = look_up(nch, 'GM_CDD', 'GM_ID', gm_id2, 'L', L2);
 
@@ -74,7 +69,7 @@ gm2  = gm_id2 * id;
 gds2 = gds_gm2 * gm2;
 
 % =========================================================================
-% 6. Updated Small-Signal & Node Pole Calculations (With M2 Loaded)
+% 6. Updated Small-Signal & Node Pole Calculations
 % =========================================================================
 RT_ideal = rd;
 
@@ -82,7 +77,7 @@ RT_ideal = rd;
 RT_actual = ((1 + gmb_gm1) .* rd) ./ (1 + gmb_gm1 + gds_gm1 + (gds2 / gm1));
 RT_dB_ohm = 20 * log10(RT_actual);
 
-% Update B: Rin updated with parallel gds2 contribution at the denominator
+% Update B: Rin updated with parallel gds2 contribution
 Rin_actual = (1 + rd * gds1) / (gm1 * (1 + gmb_gm1) + gds1 + gds2);
 
 % Update C: Input capacitance extended to include M2 drain parasitics (Cdd2)
@@ -90,35 +85,58 @@ css1_actual = gm1 / gm_css1;
 cdd2_actual = gm2 / gm_cdd2;
 Cin_total   = c_pd + css1_actual + cdd2_actual;
 
-fp1 = (1 / (2 * pi)) * (gm1 * (1 + gmb_gm1) + gds1 + gds2) / Cin_total;
+% Pole 1: Calculated using exact Rin_actual
+fp1 = 1 / (2 * pi * Rin_actual * Cin_total);
 
-% Output pole remains unchanged as M2 is attached to input node X
-fp2 = (1 / (2 * pi)) / rd / (c_L + (gm1 / gm_cdd1));
+% Pole 2: Output node includes M1 output conductance (gds1) loading
+Rout_actual = 1 / (1/rd + gds1); 
+fp2 = 1 / (2 * pi * Rout_actual * (c_L + (gm1 / gm_cdd1)));
 
 % Overall combined -3dB Bandwidth
 f_3dB = 1 / (2 * pi * sqrt((1/(2*pi*fp1))^2 + (1/(2*pi*fp2))^2));
 
-%noise
+% =========================================================================
+% 7. Advanced Noise Analysis (Input-Referred Noise Current)
+% =========================================================================
 k_B = 1.38e-23;
 T = 300;
 gamma_n = 0.6247;
 
-In_in_square = 4*k_B*T*(gamma_n*gm2+(1/rd));
-In_in_rms = sqrt(In_in_square);
+% Effective Noise Bandwidth (ENBW) - 1st order approx
+ENBW = f_3dB * (pi / 2);
+
+% A. Low-Frequency (Flat-band) Noise Density (A^2/Hz)
+% Dominated by Thermal Noise from Rd and M2
+In2_LF = 4 * k_B * T * (gamma_n * gm2 + (1 / rd));
+In_density_LF_pA = sqrt(In2_LF) * 1e12; % Convert to pA/sqrt(Hz)
+
+% B. High-Frequency Noise Peaking Contribution at f_3dB (A^2/Hz)
+% M1 channel noise amplified by total input capacitance
+In2_HF_peak = 4 * k_B * T * (gamma_n / gm1) * (2 * pi * f_3dB * Cin_total)^2;
+In_density_3dB_pA = sqrt(In2_LF + In2_HF_peak) * 1e12; % Density at f_3dB
+
+% C. Total Integrated RMS Noise Current (A_rms)
+% Integrated from DC to ENBW including the f^2 high-frequency term
+Total_In2_int = (In2_LF * ENBW) + (4 * k_B * T * (gamma_n / gm1) * (2 * pi * Cin_total)^2 * (1/3) * ENBW^3);
+In_rms_total_nA = sqrt(Total_In2_int) * 1e9; % Convert to nA_rms
 
 % =========================================================================
-% 7. Design Summary Printout
+% 8. Design Summary Printout
 % =========================================================================
-fprintf('\n================== TIA SIZING & BANDWIDTH REPORT (WITH M2) ==================\n');
+fprintf('\n================== TIA SIZING & BANDWIDTH REPORT ==================\n');
 fprintf('M1 Transistor Width (W1)     : %.2f um\n', w1 * 1e6);
 fprintf('M2 Transistor Width (W2)     : %.2f um\n', w2 * 1e6);
 fprintf('Bias Current Consumption (ID): %.2f uA\n', id * 1e6);
 fprintf('Actual Input Resistance (Rin): %.2f Ohm (Target: %.2f Ohm)\n', Rin_actual, Rin_target);
-fprintf('---------------------------------------------------------------------------\n');
+fprintf('-------------------------------------------------------------------\n');
 fprintf('Ideal Transimpedance Gain RT : %.2f Ohm\n', RT_ideal);
 fprintf('Actual Transimpedance Gain RT: %.2f Ohm (%.2f dB*Ohm)\n', RT_actual, RT_dB_ohm);
-fprintf('---------------------------------------------------------------------------\n');
+fprintf('-------------------------------------------------------------------\n');
 fprintf('Input Node Pole (fp1)        : %.2f MHz\n', fp1 / 1e6);
 fprintf('Output Node Pole (fp2)       : %.2f MHz\n', fp2 / 1e6);
 fprintf('Estimated -3dB Bandwidth     : %.2f MHz\n', f_3dB / 1e6);
-fprintf('===========================================================================\n');
+fprintf('-------------------------------------------------------------------\n');
+fprintf('Input Noise Density (DC)     : %.2f pA/sqrt(Hz)\n', In_density_LF_pA);
+fprintf('Input Noise Density (f_3dB)  : %.2f pA/sqrt(Hz)\n', In_density_3dB_pA);
+fprintf('Total Integrated RMS Noise   : %.2f nA_rms\n', In_rms_total_nA);
+fprintf('===================================================================\n');
